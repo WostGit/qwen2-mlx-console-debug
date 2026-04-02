@@ -64,9 +64,8 @@ jobs:
           set -euxo pipefail
           python - <<'PY'
           import importlib
-          pkgs = ["mlx", "mlx_lm", "huggingface_hub", "numpy", "yaml"]
           print("=== PACKAGE VERSIONS ===")
-          for name in pkgs:
+          for name in ["mlx", "mlx_lm", "huggingface_hub", "numpy", "yaml"]:
               m = importlib.import_module(name)
               print(f"{name}: {getattr(m, '__version__', 'unknown')}")
           PY
@@ -112,6 +111,7 @@ jobs:
           print("HF_HOME =", HF_HOME)
           print("HF_TOKEN_PRESENT =", bool(HF_TOKEN))
 
+          print("\nLoading model/tokenizer...")
           model, tokenizer = load(MODEL_ID)
           print("MODEL_CLASS =", type(model).__name__)
           print("TOKENIZER_CLASS =", type(tokenizer).__name__)
@@ -147,7 +147,7 @@ jobs:
               print("TOKEN_IDS =", ids)
               print("TOKEN_IDS_TYPE =", type(ids).__name__)
               print("FIRST_TOKEN_TYPE =", type(ids[0]).__name__ if ids else None)
-              assert all(isinstance(x, int) for x in ids)
+              assert all(isinstance(x, int) for x in ids), "Token ids must be Python ints"
 
               x = mx.array([ids], dtype=mx.int32)
               print("MLX_ARRAY_SHAPE =", x.shape)
@@ -157,18 +157,36 @@ jobs:
               logits = extract_logits(out)
               print("LOGITS_TYPE =", type(logits).__name__)
               print("LOGITS_SHAPE =", logits.shape)
-              print("LOGITS_DTYPE =", logits.dtype)
+              print("LOGITS_DTYPE =", getattr(logits, "dtype", None))
 
-              next_logits = logits[0, -1, :] if len(logits.shape) == 3 else logits[-1, :]
+              if len(logits.shape) == 3:
+                  next_logits = logits[0, -1, :]
+              elif len(logits.shape) == 2:
+                  next_logits = logits[-1, :]
+              else:
+                  raise RuntimeError(f"Unexpected logits shape: {logits.shape}")
+
               probs = mx.softmax(next_logits, axis=-1)
+              probs32 = probs.astype(mx.float32)
 
               print("PROBS_SHAPE =", probs.shape)
               print("PROBS_DTYPE =", probs.dtype)
-              print("PROBS_SUM =", float(mx.sum(probs).item()))
+              print("PROBS32_DTYPE =", probs32.dtype)
+              print("PROBS_SUM =", float(mx.sum(probs32).item()))
 
-              top_vals, top_idx = mx.topk(probs, k=10)
+              # MLX topk returns values only in current environment
+              top_vals = mx.topk(probs32, k=10)
+              top_idx = mx.argsort(probs32, axis=-1)[-10:]
+              top_idx = top_idx[::-1]
+
               print("TOP10_IDS =", [int(v) for v in top_idx.tolist()])
               print("TOP10_PROBS =", [float(v) for v in top_vals.tolist()])
+
+              if vocab_size is not None:
+                  print("VOCAB_MATCH =", probs.shape[-1] == vocab_size)
+                  print("MODEL_VOCAB_SIZE =", probs.shape[-1])
+                  if probs.shape[-1] != vocab_size:
+                      print("WARNING: tokenizer vocab and logits vocab differ")
 
           print("\nQWEN_STARTUP_SELF_CHECK = PASS")
           PY
@@ -214,17 +232,19 @@ jobs:
           victim = softmax(logits)
           print("VICTIM =", victim)
 
-          for name, pred in {
+          student_preds = {
               "argmax": argmax_view(victim),
               "topk": topk_view(victim, 3),
               "probs": list(victim),
-          }.items():
+          }
+
+          for name, pred in student_preds.items():
               agreement = int(max(range(len(pred)), key=lambda i: pred[i]) == max(range(len(victim)), key=lambda i: victim[i]))
               div = kl(victim, pred)
-              print(f"INTERFACE={name}")
-              print("  PRED =", pred)
-              print("  AGREEMENT =", agreement)
-              print("  KL =", div)
+              print(f"\nINTERFACE={name}")
+              print("PRED =", pred)
+              print("AGREEMENT =", agreement)
+              print("KL =", div)
           PY
 
       - name: Qwen interface experiment
@@ -270,9 +290,11 @@ jobs:
               return out
 
           def topk_view(probs, k=5):
-              vals, idx = mx.topk(probs, k=k)
-              out = mx.zeros_like(probs)
+              vals = mx.topk(probs, k=k)
+              idx = mx.argsort(probs, axis=-1)[-k:]
+              idx = idx[::-1]
               vals = vals / mx.sum(vals)
+              out = mx.zeros_like(probs)
               for j in range(k):
                   out[int(idx[j].item())] = vals[j]
               return out
@@ -298,35 +320,64 @@ jobs:
                   for prompt in prompts:
                       print("\nPROMPT =", repr(prompt))
                       ids = tokenize(tokenizer, prompt)
+                      print("TOKEN_IDS =", ids)
+                      print("TOKEN_IDS_LEN =", len(ids))
+
                       x = mx.array([ids], dtype=mx.int32)
+                      print("INPUT_SHAPE =", x.shape)
+                      print("INPUT_DTYPE =", x.dtype)
+
                       out = model(x)
                       logits = extract_logits(out)
-                      next_logits = logits[0, -1, :] if len(logits.shape) == 3 else logits[-1, :]
+                      print("LOGITS_SHAPE =", logits.shape)
+                      print("LOGITS_DTYPE =", getattr(logits, "dtype", None))
+
+                      if len(logits.shape) == 3:
+                          next_logits = logits[0, -1, :]
+                      elif len(logits.shape) == 2:
+                          next_logits = logits[-1, :]
+                      else:
+                          raise RuntimeError(f"Unexpected logits shape: {logits.shape}")
+
                       victim = mx.softmax(next_logits, axis=-1)
+                      victim32 = victim.astype(mx.float32)
+                      print("VICTIM_SUM =", float(mx.sum(victim32).item()))
+                      print("VICTIM_VOCAB =", victim.shape[-1])
 
                       if interface == "argmax":
-                          student = one_hot_from_top1(victim)
+                          student = one_hot_from_top1(victim32)
                       elif interface == "topk":
-                          student = topk_view(victim, k=5)
+                          student = topk_view(victim32, k=5)
+                      elif interface == "probs":
+                          student = victim32
                       else:
-                          student = victim
+                          raise RuntimeError(interface)
 
-                      agreement = int(int(mx.argmax(student).item()) == int(mx.argmax(victim).item()))
-                      div = float(kl_mx(victim, student).item())
+                      student32 = student.astype(mx.float32)
+                      print("STUDENT_SUM =", float(mx.sum(student32).item()))
+
+                      agreement = int(int(mx.argmax(student32).item()) == int(mx.argmax(victim32).item()))
+                      div = float(kl_mx(victim32, student32).item())
 
                       agreements.append(agreement)
                       kls.append(div)
 
-                      top_vals, top_idx = mx.topk(victim, k=10)
-                      print("TOKEN_IDS_LEN =", len(ids))
+                      top_vals = mx.topk(victim32, k=10)
+                      top_idx = mx.argsort(victim32, axis=-1)[-10:]
+                      top_idx = top_idx[::-1]
+
                       print("VICTIM_TOP10_IDS =", [int(v) for v in top_idx.tolist()])
                       print("VICTIM_TOP10_PROBS =", [float(v) for v in top_vals.tolist()])
                       print("AGREEMENT =", agreement)
                       print("KL =", div)
 
+                  mean_agreement = sum(agreements) / len(agreements)
+                  mean_kl = sum(kls) / len(kls)
                   print("\nSUMMARY")
-                  print("MEAN_AGREEMENT =", sum(agreements) / len(agreements))
-                  print("MEAN_KL =", sum(kls) / len(kls))
+                  print("MEAN_AGREEMENT =", mean_agreement)
+                  print("MEAN_KL =", mean_kl)
+
+          print("\nQWEN_INTERFACE_EXPERIMENT = PASS")
           PY
 
       - name: Final note
