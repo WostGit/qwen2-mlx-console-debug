@@ -1,0 +1,428 @@
+# .github/workflows/run.yml
+name: qwen2-mlx-console-debug
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  preliminaries:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MODEL_ID: Qwen/Qwen2-0.5B
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cache Hugging Face files
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.hf-cache
+          key: ${{ runner.os }}-hf-${{ env.MODEL_ID }}
+          restore-keys: |
+            ${{ runner.os }}-hf-
+
+      - name: System info
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "=== SYSTEM INFO ==="
+          sw_vers
+          uname -a
+          python --version
+          which python
+          echo "HF_HOME=$HF_HOME"
+          if [ -n "${HF_TOKEN:-}" ]; then
+            echo "HF_TOKEN_PRESENT=yes"
+          else
+            echo "HF_TOKEN_PRESENT=no"
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install \
+            mlx \
+            mlx-lm \
+            huggingface_hub \
+            numpy \
+            pyyaml
+
+      - name: Package versions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import importlib
+          pkgs = ["mlx", "mlx_lm", "huggingface_hub", "numpy", "yaml"]
+          print("=== PACKAGE VERSIONS ===")
+          for name in pkgs:
+              try:
+                  m = importlib.import_module(name)
+                  print(f"{name}: {getattr(m, '__version__', 'unknown')}")
+              except Exception as e:
+                  print(f"{name}: IMPORT FAILED: {e}")
+                  raise
+          PY
+
+      - name: Hugging Face auth and cache check
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          print("=== HF CHECK ===")
+          token = os.environ.get("HF_TOKEN")
+          print("HF_TOKEN_PRESENT =", bool(token))
+          print("HF_HOME =", os.environ.get("HF_HOME"))
+
+          api = HfApi(token=token if token else None)
+          try:
+              info = api.model_info("Qwen/Qwen2-0.5B")
+              print("MODEL EXISTS =", info.id)
+          except Exception as e:
+              print("MODEL INFO FAILED =", repr(e))
+              raise
+          PY
+
+      - name: Qwen startup self-check
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os
+          import platform
+          import sys
+
+          import mlx.core as mx
+          from mlx_lm import load
+
+          MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
+          HF_TOKEN = os.environ.get("HF_TOKEN")
+          HF_HOME = os.environ.get("HF_HOME")
+
+          print("=== QWEN STARTUP SELF-CHECK ===")
+          print("PYTHON =", sys.version)
+          print("PLATFORM =", platform.platform())
+          print("MODEL_ID =", MODEL_ID)
+          print("HF_HOME =", HF_HOME)
+          print("HF_TOKEN_PRESENT =", bool(HF_TOKEN))
+
+          print("\nLoading model/tokenizer...")
+          model, tokenizer = load(MODEL_ID)
+          print("MODEL_CLASS =", type(model).__name__)
+          print("TOKENIZER_CLASS =", type(tokenizer).__name__)
+
+          vocab_size = None
+          for attr in ["vocab_size", "n_words"]:
+              if hasattr(tokenizer, attr):
+                  try:
+                      vocab_size = getattr(tokenizer, attr)
+                      break
+                  except Exception:
+                      pass
+          print("TOKENIZER_VOCAB_SIZE =", vocab_size)
+
+          prompts = [
+              "Hello world",
+              "The capital of France is",
+              "2 + 2 ="
+          ]
+
+          def tokenize(tok, text):
+              if hasattr(tok, "encode"):
+                  ids = tok.encode(text)
+                  if ids and isinstance(ids[0], list):
+                      ids = ids[0]
+                  return list(ids)
+              if callable(tok):
+                  out = tok(text)
+                  if isinstance(out, dict) and "input_ids" in out:
+                      ids = out["input_ids"]
+                      if ids and isinstance(ids[0], list):
+                          ids = ids[0]
+                      return list(ids)
+              raise RuntimeError("Could not tokenize prompt with available tokenizer API")
+
+          def extract_logits(out):
+              if hasattr(out, "logits"):
+                  return out.logits
+              if isinstance(out, tuple) and len(out) > 0:
+                  return out[0]
+              return out
+
+          for i, prompt in enumerate(prompts):
+              print("\n--- PROMPT", i, "---")
+              print("TEXT =", repr(prompt))
+              ids = tokenize(tokenizer, prompt)
+              print("TOKEN_IDS =", ids)
+              print("TOKEN_IDS_TYPE =", type(ids).__name__)
+              print("FIRST_TOKEN_TYPE =", type(ids[0]).__name__ if ids else None)
+              assert all(isinstance(x, int) for x in ids), "Token ids must be plain Python ints"
+
+              x = mx.array([ids], dtype=mx.int32)
+              print("MLX_ARRAY_SHAPE =", x.shape)
+              print("MLX_ARRAY_DTYPE =", x.dtype)
+
+              try:
+                  out = model(x)
+              except TypeError:
+                  try:
+                      out = model(x, cache=None)
+                  except Exception as e:
+                      print("FORWARD_FAILED =", repr(e))
+                      raise
+
+              logits = extract_logits(out)
+              print("LOGITS_TYPE =", type(logits).__name__)
+              if hasattr(logits, "shape"):
+                  print("LOGITS_SHAPE =", logits.shape)
+              if hasattr(logits, "dtype"):
+                  print("LOGITS_DTYPE =", logits.dtype)
+
+              # Do NOT convert full logits to numpy.
+              # Stay in MLX and only inspect tiny derived values.
+              if len(logits.shape) == 3:
+                  next_logits = logits[0, -1, :]
+              elif len(logits.shape) == 2:
+                  next_logits = logits[-1, :]
+              else:
+                  raise RuntimeError(f"Unexpected logits shape: {logits.shape}")
+
+              probs = mx.softmax(next_logits, axis=-1)
+              print("PROBS_SHAPE =", probs.shape)
+              print("PROBS_DTYPE =", probs.dtype)
+
+              # Safe scalar extraction only
+              prob_sum = float(mx.sum(probs).item())
+              print("PROBS_SUM =", prob_sum)
+
+              top_vals, top_idx = mx.topk(probs, k=10)
+              print("TOP10_IDS =", [int(v) for v in top_idx.tolist()])
+              print("TOP10_PROBS =", [float(v) for v in top_vals.tolist()])
+
+              if vocab_size is not None:
+                  assert probs.shape[-1] == vocab_size, (
+                      f"Vocab mismatch: probs={probs.shape[-1]} tokenizer={vocab_size}"
+                  )
+
+          print("\nQWEN_STARTUP_SELF_CHECK = PASS")
+          PY
+
+      - name: Toy interface experiment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import math
+          import random
+
+          random.seed(0)
+
+          print("=== TOY INTERFACE EXPERIMENT ===")
+
+          vocab = ["A", "B", "C", "D", "E"]
+
+          def softmax(xs):
+              m = max(xs)
+              ex = [math.exp(x - m) for x in xs]
+              s = sum(ex)
+              return [x / s for x in ex]
+
+          def kl(p, q, eps=1e-12):
+              out = 0.0
+              for pi, qi in zip(p, q):
+                  qi = max(qi, eps)
+                  pi = max(pi, eps)
+                  out += pi * math.log(pi / qi)
+              return out
+
+          def argmax_view(p):
+              j = max(range(len(p)), key=lambda i: p[i])
+              out = [0.0] * len(p)
+              out[j] = 1.0
+              return out
+
+          def topk_view(p, k=3):
+              idx = sorted(range(len(p)), key=lambda i: p[i], reverse=True)[:k]
+              out = [0.0] * len(p)
+              s = sum(p[i] for i in idx)
+              for i in idx:
+                  out[i] = p[i] / s
+              return out
+
+          logits = [1.7, 0.9, 0.4, -0.2, -1.1]
+          victim = softmax(logits)
+          print("VICTIM =", victim)
+
+          student_preds = {
+              "argmax": argmax_view(victim),
+              "topk": topk_view(victim, 3),
+              "probs": list(victim),
+          }
+
+          for name, pred in student_preds.items():
+              agreement = int(max(range(len(pred)), key=lambda i: pred[i]) == max(range(len(victim)), key=lambda i: victim[i]))
+              div = kl(victim, pred)
+              print(f"INTERFACE={name}")
+              print("  PRED =", pred)
+              print("  AGREEMENT =", agreement)
+              print("  KL =", div)
+          PY
+
+      - name: Qwen interface experiment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import math
+          import os
+          import random
+
+          import mlx.core as mx
+          from mlx_lm import load
+
+          random.seed(0)
+
+          MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
+          print("=== QWEN INTERFACE EXPERIMENT ===")
+          print("MODEL_ID =", MODEL_ID)
+
+          model, tokenizer = load(MODEL_ID)
+
+          prompts = [
+              "The capital of France is",
+              "2 + 2 =",
+              "The opposite of cold is",
+          ]
+
+          def tokenize(tok, text):
+              if hasattr(tok, "encode"):
+                  ids = tok.encode(text)
+                  if ids and isinstance(ids[0], list):
+                      ids = ids[0]
+                  return list(ids)
+              if callable(tok):
+                  out = tok(text)
+                  if isinstance(out, dict) and "input_ids" in out:
+                      ids = out["input_ids"]
+                      if ids and isinstance(ids[0], list):
+                          ids = ids[0]
+                      return list(ids)
+              raise RuntimeError("Could not tokenize prompt")
+
+          def extract_logits(out):
+              if hasattr(out, "logits"):
+                  return out.logits
+              if isinstance(out, tuple) and len(out) > 0:
+                  return out[0]
+              return out
+
+          def one_hot_from_top1(probs):
+              idx = int(mx.argmax(probs).item())
+              out = mx.zeros_like(probs)
+              out[idx] = 1.0
+              return out
+
+          def topk_view(probs, k=5):
+              vals, idx = mx.topk(probs, k=k)
+              renorm = vals / mx.sum(vals)
+              out = mx.zeros_like(probs)
+              for j in range(k):
+                  out[int(idx[j].item())] = renorm[j]
+              return out
+
+          def kl_mx(p, q, eps=1e-12):
+              p = mx.maximum(p, eps)
+              q = mx.maximum(q, eps)
+              return mx.sum(p * mx.log(p / q))
+
+          budgets = [64, 128, 256]
+          interfaces = ["argmax", "topk", "probs"]
+
+          for budget in budgets:
+              print("\n==============================")
+              print("BUDGET =", budget)
+              print("==============================")
+
+              for interface in interfaces:
+                  print("\nINTERFACE =", interface)
+                  agreements = []
+                  kls = []
+
+                  for prompt in prompts:
+                      print("\nPROMPT =", repr(prompt))
+                      ids = tokenize(tokenizer, prompt)
+                      x = mx.array([ids], dtype=mx.int32)
+                      out = model(x)
+                      logits = extract_logits(out)
+
+                      if len(logits.shape) == 3:
+                          next_logits = logits[0, -1, :]
+                      elif len(logits.shape) == 2:
+                          next_logits = logits[-1, :]
+                      else:
+                          raise RuntimeError(f"Unexpected logits shape: {logits.shape}")
+
+                      victim = mx.softmax(next_logits, axis=-1)
+
+                      if interface == "argmax":
+                          target = one_hot_from_top1(victim)
+                      elif interface == "topk":
+                          target = topk_view(victim, k=5)
+                      elif interface == "probs":
+                          target = victim
+                      else:
+                          raise RuntimeError(interface)
+
+                      # Minimal self-contained "student":
+                      # use the interface target directly as the student prediction
+                      # for debugging the metric path and support alignment.
+                      student = target
+
+                      agreement = int(int(mx.argmax(student).item()) == int(mx.argmax(victim).item()))
+                      div = float(kl_mx(victim, student).item())
+
+                      agreements.append(agreement)
+                      kls.append(div)
+
+                      top_vals, top_idx = mx.topk(victim, k=10)
+                      print("TOKEN_IDS_LEN =", len(ids))
+                      print("VICTIM_TOP10_IDS =", [int(v) for v in top_idx.tolist()])
+                      print("VICTIM_TOP10_PROBS =", [float(v) for v in top_vals.tolist()])
+                      print("AGREEMENT =", agreement)
+                      print("KL =", div)
+
+                  mean_agreement = sum(agreements) / len(agreements)
+                  mean_kl = sum(kls) / len(kls)
+                  print("\nSUMMARY")
+                  print("MEAN_AGREEMENT =", mean_agreement)
+                  print("MEAN_KL =", mean_kl)
+          PY
+
+      - name: Final note
+        if: always()
+        shell: bash
+        run: |
+          echo "=== DONE ==="
+          echo "All preliminaries printed directly to console."
+          echo "If this passed, the next step is to move the inline Python into main.py."
